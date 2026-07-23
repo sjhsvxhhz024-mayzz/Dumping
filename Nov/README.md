@@ -1,58 +1,34 @@
+# Nov — dumper & offline resolvers
 
+Scripts that turn `libil2cpp.so` + decrypted `global-metadata.dat` into the
+headers consumed by `proj/`.  All scripts are pure Python 3 stdlib unless
+otherwise noted.
 
-Полностью ручная реконструкция дампа из `libil2cpp.so` + расшифрованной
-`global-metadata.dat` (magic 0xFAB11BAF, version 39, header XOR-key 0xA5C3F19D,
-зашифрованный диапазон [0x08,0x17C)). Сетевого доступа не использовалось.
+## Files
 
-## Файлы
-- `dump.cs`      — дамп в формате Il2CppDumper (29 366 типов, 188 образов).
-- `script.json`  — {"ScriptMethod":[{Address,Name,Signature}]}, 190 128 методов
-                    с реальными адресами (десятичные VA, как у Il2CppDumper).
-- `il2cpp.h`     — заголовок с per-type структурами `<T>_Fields` / `<T>_o`
-                    и смещениями полей (функциональный, не байт-в-байт).
-- `resolver.py`  — ядро: парсинг ELF (LOAD/PT_DYNAMIC/DT_RELA), таблица
-                    релокаций R_AARCH64_RELATIVE (1 225 654), va<->offset,
-                    tdname, read_type (с раскрытием дженериков GENERICINST).
-- `codereg.py` / `codereg.json` — Il2CppCodeGenModule[] (183 модуля): base,
-                    methodPointerCount (mpc), methodPointers VA (mpp).
-- `dumpgen.py`   — генератор dump.cs.
-- `scriptgen.py` — генератор script.json.
-- `il2cppgen.py` — генератор il2cpp.h.
+- `resolver.py` — ELF + relocation parser, feeds every other script.
+- `codereg.py` — finds `Il2CppCodeRegistration` and 183 CodeGenModules.
+- `dumpgen.py` — emits per-image/per-method RVA tables.
+- `il2cppgen.py` — field-offset generator.
+- `scriptgen.py` — companion `script.json`-style output for the C++ side.
+- `runtime_probe.py` — Frida script that logs live `Il2CppClass*` addresses
+  from a running process (fallback for values not resolvable offline).
+- `typeinfo_offline.py` — **offline** TypeInfo slot RVA resolver.  Scans
+  `libil2cpp.so` .text for the codegen'd
+  `MOVZ W0,#<TDI>` → `BL GetTypeInfoFromTypeDefinitionIndex` → `ADRP`/`STR`
+  pattern and prints a drop-in patch for `proj/include/oxide_offsets.h`.
+  No runtime log required. Refs #2.
 
-## Как перезапустить
-```
-cp libil2cpp.so global-metadata.dat /data/     # decrypted metadata
-python3 -B dumpgen.py && python3 -B scriptgen.py && python3 -B il2cppgen.py
-```
-
-## Runtime-подтяжка RVA после обновления игры (`runtime_probe.py`)
-Меню в `proj/` теперь при старте фоново сканирует память процесса и логирует
-`TypeInfoRVA` для всех известных классов (`[sweep]` / `[AUTO]` строки в
-`/sdcard/Download/EclipsOxide/eclips_oxide_*.log`).
+## Typical flow
 
 ```
-adb pull /sdcard/Download/EclipsOxide/eclips_oxide_*.log ./
-python3 runtime_probe.py ./eclips_oxide_YYYYMMDD_HHMMSS.log
+# 1. decrypt metadata (proj/tools/decrypt_metadata.py)
+# 2. dump everything static
+python3 Nov/dumpgen.py libil2cpp.so global-metadata.decrypted.dat
+python3 Nov/codereg.py libil2cpp.so
+python3 Nov/il2cppgen.py libil2cpp.so global-metadata.decrypted.dat
+# 3. resolve TypeInfo slots offline
+python3 Nov/typeinfo_offline.py libil2cpp.so
+#    (paste output into proj/include/oxide_offsets.h)
+# 4. only if a slot is unresolved — fall back to runtime_probe.py
 ```
-
-Скрипт выведет табличку "log RVA vs. oxide_offsets.h" и готовый патч-фрагмент
-для вставки в `proj/include/oxide_offsets.h`, если игра обновилась и RVA
-сдвинулись. Полагается на `[sweep]` / `[AUTO]` / `[scan] ... FOUND` строки —
-их emit'ит `main.cpp:ox_logStartupDiagnostics()` при каждом запуске чита.
-
-## Как разрешаются адреса методов (проверено дизассемблером)
-`rid = token & 0xFFFFFF`; модуль = codeGenModule с именем образа объявляющего
-типа; `addr = reloc[module.mpp + (rid-1)*8]`.
-Проверка: `Joystick.get_Health` rid 16888 -> 0x5B82C4C (точное совпадение с
-дизассемблером: ldr s0,[x0,#0x30] / ret), `set_Health` -> 0x5B82C54.
-
-
-
-
-## Статус `|-RVA:` (адреса инстанциаций дженерик-методов)
-Это требует восстановления таблиц Il2CppMetadataRegistration.methodSpecs +
-genericMethodTable + Il2CppCodeRegistration.genericMethodPointers. На данной
-защищённой/обфусцированной сборке их надёжная привязка не гарантирована
-(предупреждал: дольше и рискованно). В этом архиве основной дамп полный и
-корректный без них; при подтверждённой привязке эти строки добавляются
-отдельным проходом.
