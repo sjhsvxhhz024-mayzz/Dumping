@@ -25,6 +25,21 @@ cp libil2cpp.so global-metadata.dat /data/     # decrypted metadata
 python3 -B dumpgen.py && python3 -B scriptgen.py && python3 -B il2cppgen.py
 ```
 
+## Runtime-подтяжка RVA после обновления игры (`runtime_probe.py`)
+Меню в `proj/` теперь при старте фоново сканирует память процесса и логирует
+`TypeInfoRVA` для всех известных классов (`[sweep]` / `[AUTO]` строки в
+`/sdcard/Download/EclipsOxide/eclips_oxide_*.log`).
+
+```
+adb pull /sdcard/Download/EclipsOxide/eclips_oxide_*.log ./
+python3 runtime_probe.py ./eclips_oxide_YYYYMMDD_HHMMSS.log
+```
+
+Скрипт выведет табличку "log RVA vs. oxide_offsets.h" и готовый патч-фрагмент
+для вставки в `proj/include/oxide_offsets.h`, если игра обновилась и RVA
+сдвинулись. Полагается на `[sweep]` / `[AUTO]` / `[scan] ... FOUND` строки —
+их emit'ит `main.cpp:ox_logStartupDiagnostics()` при каждом запуске чита.
+
 ## Как разрешаются адреса методов (проверено дизассемблером)
 `rid = token & 0xFFFFFF`; модуль = codeGenModule с именем образа объявляющего
 типа; `addr = reloc[module.mpp + (rid-1)*8]`.

@@ -66,15 +66,19 @@ LOCAL_CPPFLAGS := -std=c++17 -fno-rtti -fexceptions
 #   -lm       math
 # Private SurfaceComposer symbols (libgui.so/libutils.so) are resolved at
 # runtime via dlsym — no link-time dependency.
+#
+# libc++_static / libc++abi.a — НЕ линкуем здесь: APP_STL в Application.mk
+# уже стоит `c++_static`, ndk-build подтягивает правильную статическую пару
+# из хостового NDK сам (Linux / macOS / Windows). Прошлая версия жёстко
+# ссылалась на `C:/ndk/toolchains/...` — работало только на Windows и ломало
+# кросс-сборку на CI/Linux.
 LOCAL_LDLIBS := \
     -llog \
     -landroid \
     -lEGL \
     -lGLESv3 \
     -ldl \
-    -lm \
-    C:/ndk/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
-    C:/ndk/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
+    -lm
 
 # Build as a standalone executable (not a .so). Runs under `su` on device.
 include $(BUILD_EXECUTABLE)

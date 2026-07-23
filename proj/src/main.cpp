@@ -49,8 +49,54 @@
 #include <sstream>
 #include <mutex>
 #include <vector>
+#include <atomic>
+#include <chrono>
 
 bool main_thread_flag = true;
+
+// ============================================================================
+//  Startup pipeline (async).
+//  Startup diagnostics + TypeInfo auto-resolve сканируют десятки/сотни МБ памяти
+//  процесса игры и раньше вызывались синхронно в main() ДО входа в цикл рендера.
+//  На защищённом билде Oxide это могло длиться минуты — meню за это время
+//  вообще не открывалось (erafox видел зависший лог сразу после
+//  "TypeInfo fallback из хедера: PM=... BP=... PV=...").
+//  Новая схема: initGUI_draw() → touch → whileLoop СРАЗУ, а диагностика/резолв
+//  идут в фоновом std::thread. UpdatePlayerCache/ox_getStatics пропускают
+//  проход, пока фон не закончил, — меню отрисовывается с первого кадра, а
+//  в углу видно строку статуса.
+// ============================================================================
+static std::atomic<bool> g_startupThreadStarted{false};
+static std::atomic<bool> g_startupDone{false};
+static std::atomic<bool> g_startupInProgress{false};
+static std::mutex        g_startupStatusMutex;
+static std::string       g_startupStatus = "\xd0\xbe\xd0\xb6\xd0\xb8\xd0\xb4\xd0\xb0\xd0\xbd\xd0\xb8\xd0\xb5"; // "ожидание"
+
+static void ox_setStartupStatus(const std::string &s) {
+    std::lock_guard<std::mutex> l(g_startupStatusMutex);
+    g_startupStatus = s;
+}
+std::string ox_getStartupStatus() {
+    std::lock_guard<std::mutex> l(g_startupStatusMutex);
+    return g_startupStatus;
+}
+
+// Deadline для тяжёлых сканов памяти. Возвращает true если пора закруглиться.
+// Проверяется вручную внутри цикла-сканера, чтобы не подвешивать UI.
+static std::atomic<uint64_t> g_scanDeadlineMs{0};
+static bool ox_scanTimedOut() {
+    uint64_t d = g_scanDeadlineMs.load(std::memory_order_relaxed);
+    if (!d) return false;
+    uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now >= d;
+}
+static void ox_setScanDeadline(uint64_t seconds) {
+    uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    g_scanDeadlineMs.store(now + seconds * 1000, std::memory_order_relaxed);
+}
+static void ox_clearScanDeadline() { g_scanDeadlineMs.store(0, std::memory_order_relaxed); }
 
 int abs_ScreenX = 0;
 int abs_ScreenY = 0;
@@ -749,6 +795,7 @@ static void ox_findAscii(const std::vector<OxMapRange> &maps, const char *needle
     for (const OxMapRange &map : maps) {
         size_t carry = 0;
         for (uint64_t at = map.start; at < map.end && matches.size() < maxMatches;) {
+            if (ox_scanTimedOut()) return;
             size_t want = (size_t)std::min<uint64_t>(chunkSize, map.end - at);
             if (!vm_readv(at, buffer.data() + carry, want)) { carry = 0; at += want; continue; }
             size_t total = carry + want;
@@ -771,6 +818,7 @@ static uint64_t ox_findClassByName(uint64_t nameAddress, const char *className,
     std::vector<uint8_t> buffer(chunkSize);
     for (const OxMapRange &map : rwMaps) {
         for (uint64_t at = map.start; at < map.end;) {
+            if (ox_scanTimedOut()) return 0;
             size_t want = (size_t)std::min<uint64_t>(chunkSize, map.end - at);
             if (!vm_readv(at, buffer.data(), want)) { at += want; continue; }
             for (size_t i = 0; i + sizeof(uint64_t) <= want; i += sizeof(uint64_t)) {
@@ -793,16 +841,40 @@ static uint64_t ox_findClassByName(uint64_t nameAddress, const char *className,
 // name-указатель. Если оно ведёт в пул строк и strcmp совпал — это klass+0x10.
 // Не зависит от того, какую именно копию имени держит класс (каноничную из
 // блоба метадаты), поэтому чинит прошлый "класс не найден" при найденных литералах.
+//
+// Кооперативный deadline: если ox_setScanDeadline(N) выставлен, скан свернётся
+// после его истечения и вернёт 0 — исключает подвисание фона на десятки минут
+// при сканировании многогигабайтной кучи Unity.
 static uint64_t ox_scanClassByName(const char *className, const char *nameSpace,
                                    const std::vector<OxMapRange> &scanMaps,
                                    uint64_t strLo, uint64_t strHi) {
     const size_t chunkSize = 1024 * 1024;
     std::vector<uint8_t> buffer(chunkSize);
+    uint64_t regionsSeen = 0, regionsScanned = 0, bytesScanned = 0;
     for (const OxMapRange &map : scanMaps) {
-        if ((map.end - map.start) > 128ULL * 1024 * 1024) continue; // пропускаем GC-кучу
+        regionsSeen++;
+        uint64_t sz = map.end - map.start;
+        if (sz > 128ULL * 1024 * 1024) {
+            OXLOGT("[scan] %s: skip region 0x%llx..0x%llx (%llu MB) — GC-heap",
+                   className, (unsigned long long)map.start, (unsigned long long)map.end,
+                   (unsigned long long)(sz >> 20));
+            continue;
+        }
+        regionsScanned++;
+        OXLOGT("[scan] %s: region %llu/%llu 0x%llx..0x%llx (%llu KB)",
+               className, (unsigned long long)regionsScanned, (unsigned long long)scanMaps.size(),
+               (unsigned long long)map.start, (unsigned long long)map.end,
+               (unsigned long long)(sz >> 10));
         for (uint64_t at = map.start; at < map.end;) {
+            if (ox_scanTimedOut()) {
+                OXLOGW("[scan] %s: TIMEOUT после %llu регионов / %llu MB",
+                       className, (unsigned long long)regionsScanned,
+                       (unsigned long long)(bytesScanned >> 20));
+                return 0;
+            }
             size_t want = (size_t)std::min<uint64_t>(chunkSize, map.end - at);
             if (!vm_readv(at, buffer.data(), want)) { at += want; continue; }
+            bytesScanned += want;
             for (size_t i = 0; i + sizeof(uint64_t) <= want; i += sizeof(uint64_t)) {
                 uint64_t namePtr = 0;
                 memcpy(&namePtr, buffer.data() + i, sizeof(namePtr));
@@ -812,21 +884,29 @@ static uint64_t ox_scanClassByName(const char *className, const char *nameSpace,
                 uint64_t klass = at + i - ox::CLASS_NAME;
                 uint64_t nsPtr = rpm<uint64_t>(klass + ox::CLASS_NAMESPACE);
                 if (nameSpace && !ox_asciiEquals(nsPtr, nameSpace)) continue;
+                OXLOGI("[scan] %s.%s FOUND klass=0x%llx после %llu MB",
+                       nameSpace ? nameSpace : "*", className,
+                       (unsigned long long)klass, (unsigned long long)(bytesScanned >> 20));
                 return klass;
             }
             at += want;
         }
     }
+    OXLOGT("[scan] %s: not found после %llu MB (%llu регионов)",
+           className, (unsigned long long)(bytesScanned >> 20),
+           (unsigned long long)regionsScanned);
     return 0;
 }
 
 // Finds the writable libil2cpp TypeInfo slot containing klass and converts its
-// runtime address to an RVA from il2cpp_base.
+// runtime address to an RVA from il2cpp_base. Уважает deadline из
+// ox_setScanDeadline().
 static uint64_t ox_findTypeInfoRVA(uint64_t klass, const std::vector<OxMapRange> &libRwMaps) {
     const size_t chunkSize = 1024 * 1024;
     std::vector<uint8_t> buffer(chunkSize);
     for (const OxMapRange &map : libRwMaps) {
         for (uint64_t at = map.start; at < map.end;) {
+            if (ox_scanTimedOut()) return 0;
             size_t want = (size_t)std::min<uint64_t>(chunkSize, map.end - at);
             if (!vm_readv(at, buffer.data(), want)) { at += want; continue; }
             for (size_t i = 0; i + sizeof(uint64_t) <= want; i += sizeof(uint64_t)) {
@@ -839,6 +919,40 @@ static uint64_t ox_findTypeInfoRVA(uint64_t klass, const std::vector<OxMapRange>
         }
     }
     return 0;
+}
+
+// Forward-decl: sweep вызывает auto-resolve, а тот определён ниже.
+static bool ox_autoResolveTypeInfo(const char *className, const char *nameSpace,
+                                   uint64_t &outRVA, uint64_t &outKlass, bool full);
+
+// Runtime-скан ВСЕХ известных TypeInfo (по именам + namespace), с записью
+// найденного RVA в лог. Служит источником свежих RVA для oxide_offsets.h после
+// обновления игры — erafox прочитает Download-лог и обновит хардкод.
+static void ox_sweepAllTypeInfos(bool full) {
+    struct Known { const char *ns; const char *name; };
+    static const Known kKnown[] = {
+        {"Oxide",           "PlayerManager"},
+        {"Oxide.Building",  "BuildingPiece"},
+        {"Oxide",           "PlayerVitals"},
+        {"Oxide",           "GenericVitals"},
+        {"Oxide",           "EntityVitals"},
+        {"Oxide",           "MouseLook"},
+        {"Oxide",           "RaycastManager"},
+        {"Oxide.Weapons",   "WeaponRecoil"},
+        {"Oxide.Weapons",   "FPHitscan"},
+        {"UnityEngine",     "Camera"},
+        {"UnityEngine",     "Transform"},
+    };
+    oxlog::section("TYPEINFO SWEEP (runtime)");
+    for (const Known &k : kKnown) {
+        if (ox_scanTimedOut()) { OXLOGW("[sweep] deadline, дальше не сканируем"); break; }
+        uint64_t rva = 0, klass = 0;
+        bool ok = ox_autoResolveTypeInfo(k.name, k.ns, rva, klass, full);
+        OXLOGI("[sweep] %-24s ns=%-16s -> klass=0x%llx  TypeInfoRVA=0x%llx  %s",
+               k.name, k.ns, (unsigned long long)klass, (unsigned long long)rva,
+               ok ? "OK" : "MISS");
+    }
+    OXLOGI("[sweep] завершён. Скопируй RVA в include/oxide_offsets.h если правишь fallback.");
 }
 
 // On-demand recovery of TypeInfo RVAs after a game update. First finds the
@@ -1062,8 +1176,11 @@ static void ox_dumpDecryptedMetadata() {
     time_t now = time(nullptr);
     struct tm tmv{};
     localtime_r(&now, &tmv);
+    const char *dir = oxlog::activeDir();
+    if (!dir || !dir[0]) dir = "/sdcard/Download/EclipsOxide";
     snprintf(outputPath, sizeof(outputPath),
-             "/sdcard/Download/global-metadata_%04d%02d%02d_%02d%02d%02d.dat",
+             "%s/global-metadata_%04d%02d%02d_%02d%02d%02d.dat",
+             dir,
              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
@@ -1907,6 +2024,15 @@ void UpdatePlayerCache() {
         return;
     }
 
+    // Пока фоновый startup thread ещё не закончил (типично 10-60 сек на
+    // защищённом Oxide), не запускаем СВОЙ синхронный auto-resolve — он
+    // блокировал бы главный тред и повторял бы работу. Меню продолжает
+    // рисоваться. Как только g_startupDone=true — обычный ход.
+    if (g_startupInProgress.load(std::memory_order_relaxed)) {
+        cache_needs_update = true;
+        return;
+    }
+
     oxlog::frameCounter++;
     bool full = oxlog::shouldLogFull();   // подробно — первые N кадров
     static int diag = 0;
@@ -2174,6 +2300,14 @@ static void ox_logStartupDiagnostics() {
     OXDUMP(BP_ADDITIONAL_BOUNDS); OXDUMP(BP_M_GRADE); OXDUMP(BP_GRADE_HOLDER);
     OXDUMP(BP_PIECE_NAME); OXDUMP(BP_ID); OXDUMP(BP_HEALTH); OXDUMP(BP_MAXHEALTH);
     #undef OXDUMP
+
+    // Полный runtime-sweep всех известных TypeInfo — то, что erafox просил в чате:
+    // «нужно же найти все тайпинфо рва оффсеты логгингом». Вывод пойдёт в тот же
+    // /sdcard/Download/EclipsOxide/eclips_oxide_*.log — оттуда переносить в
+    // include/oxide_offsets.h.
+    if (il2cpp_base) ox_sweepAllTypeInfos(true);
+    else OXLOGW("[sweep] пропущен: il2cpp_base ещё не готова");
+
     OXLOGI("STARTUP DIAGNOSTICS завершён");
 }
 
@@ -2229,11 +2363,30 @@ int main(int argc, char *argv[]) {
 	       il2cpp_base ? "" : " (пока не загруж��н — дождёмся в цикле)");
 	if (!il2cpp_base) dump_maps_matching("il2cpp", 12);
 
-	// Полный стартовый диагностический дамп в файл лога (Download).
-	ox_logStartupDiagnostics();
-    
+    // Логи, dump метадаты и всё что чит пишет наружу — в одну папку.
+    OXLOGI("Артефакты в: %s", oxlog::activeDir());
+
     Touch_Init(displayInfo.width, displayInfo.height, displayInfo.orientation, true);
-    
+
+    // Полный стартовый диагностический дамп + TypeInfo auto-resolve вынесены в
+    // фоновый поток, чтобы главный цикл рендера запустился с первого кадра, а
+    // меню появилось сразу — до этой правки клиент подвисал минуты на сканах
+    // памяти (см. лог erafox: обрывался на "TypeInfo fallback из хедера: ...").
+    if (!g_startupThreadStarted.exchange(true)) {
+        std::thread([](){
+            g_startupInProgress = true;
+            ox_setStartupStatus("startup diagnostics...");
+            OXLOGI("[startup] фоновая диагностика стартовала (thread)");
+            ox_setScanDeadline(90);   // 90 сек. хватит и на защищённые билды
+            ox_logStartupDiagnostics();
+            ox_clearScanDeadline();
+            ox_setStartupStatus(g_playerManagerKlass ? "ready" : "ready (без klass — matches?)");
+            g_startupDone = true;
+            g_startupInProgress = false;
+            OXLOGI("[startup] фоновая диагностика завершена");
+        }).detach();
+    }
+
     while (main_thread_flag) {
         drawBegin();
         Layout_tick_UI();

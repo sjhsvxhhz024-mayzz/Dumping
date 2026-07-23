@@ -17,11 +17,13 @@ Nov/codereg.json
 
 # ---- Menu-side generated / build artifacts --------------------------------
 proj/dump.cs
-proj/libs/arm64-v8a/oxideesp
+# NDK build products (all ABIs, any executable / library name).
+proj/libs/arm64-v8a/*
 proj/libs/armeabi-v7a/*
 proj/libs/x86/*
 proj/libs/x86_64/*
 !proj/libs/**/.gitkeep
+proj/obj/
 
 # ---- Vendored font blob (6.7 MB C-array, bring your own or regenerate) ---
 proj/include/ImGui/font/Font.h
