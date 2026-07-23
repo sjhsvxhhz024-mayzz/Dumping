@@ -23,6 +23,9 @@ proj/libs/x86/*
 proj/libs/x86_64/*
 !proj/libs/**/.gitkeep
 
+# ---- Vendored font blob (6.7 MB C-array, bring your own or regenerate) ---
+proj/include/ImGui/font/Font.h
+
 # ---- NDK / native build products -----------------------------------------
 obj/
 libs/*/lib*.so

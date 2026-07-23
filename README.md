@@ -46,6 +46,7 @@ Big / regenerable inputs and outputs:
 | `Nov/dump.cs`, `Nov/script.json`, `Nov/il2cpp.h`, `Nov/codereg.json` | — | outputs of `dumpgen.py` / `scriptgen.py` / `il2cppgen.py`, regenerate |
 | `proj/dump.cs` | ~38 MB | copied dumper output, regenerate |
 | `proj/libs/arm64-v8a/oxideesp` | ~3.8 MB | NDK build artifact, rebuild with `ndk-build` |
+| `proj/include/ImGui/font/Font.h` | ~6.7 MB | vendored font blob (C `unsigned char[]`), regenerate with `binary_to_compressed_c` from Dear ImGui `misc/fonts/` |
 
 Bring `libil2cpp.so` + decrypted `global-metadata.dat` in yourself, then:
 
