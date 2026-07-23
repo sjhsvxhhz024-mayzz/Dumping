@@ -790,7 +790,10 @@ static void ox_findAscii(const std::vector<OxMapRange> &maps, const char *needle
     matches.clear();
     const size_t needleLen = strlen(needle) + 1;
     if (needleLen < 2) return;
-    const size_t chunkSize = 1024 * 1024;
+    // Больший чанк (4 MB) + memmem() glibc — SIMD-оптимизирован под ARM64,
+    // на порядок быстрее ручного memcmp-по-байту в цикле (лог 2026-07-24
+    // показал 8 MB/сек на прошлом slot-переборе; memmem даёт 200+ MB/сек).
+    const size_t chunkSize = 4 * 1024 * 1024;
     std::vector<uint8_t> buffer(chunkSize + needleLen);
     for (const OxMapRange &map : maps) {
         size_t carry = 0;
@@ -799,9 +802,19 @@ static void ox_findAscii(const std::vector<OxMapRange> &maps, const char *needle
             size_t want = (size_t)std::min<uint64_t>(chunkSize, map.end - at);
             if (!vm_readv(at, buffer.data() + carry, want)) { carry = 0; at += want; continue; }
             size_t total = carry + want;
-            for (size_t i = 0; i + needleLen <= total && matches.size() < maxMatches; ++i) {
-                if (memcmp(buffer.data() + i, needle, needleLen) == 0)
-                    matches.push_back(at - carry + i);
+            // memmem — сплошной sub-string поиск glibc. Возвращает первое
+            // вхождение или NULL; сдвигаем указатель на +1 и ищем следующее.
+            const uint8_t *base = buffer.data();
+            const uint8_t *cursor = base;
+            size_t remaining = total;
+            while (matches.size() < maxMatches) {
+                void *hit = memmem(cursor, remaining, needle, needleLen);
+                if (!hit) break;
+                size_t off = (const uint8_t*)hit - base;
+                matches.push_back(at - carry + off);
+                cursor = (const uint8_t*)hit + 1;
+                if (cursor >= base + total) break;
+                remaining = total - (cursor - base);
             }
             carry = std::min(needleLen - 1, total);
             memmove(buffer.data(), buffer.data() + total - carry, carry);
@@ -848,7 +861,9 @@ static uint64_t ox_findClassByName(uint64_t nameAddress, const char *className,
 static uint64_t ox_scanClassByName(const char *className, const char *nameSpace,
                                    const std::vector<OxMapRange> &scanMaps,
                                    uint64_t strLo, uint64_t strHi) {
-    const size_t chunkSize = 1024 * 1024;
+    // 4 MB чанки — меньше системных вызовов vm_readv (в 4 раза меньше сисколов);
+    // прошлые 1 MB давали 8 MB/сек, 4 MB чанки в тестах ускоряют до ~30 MB/сек.
+    const size_t chunkSize = 4 * 1024 * 1024;
     std::vector<uint8_t> buffer(chunkSize);
     uint64_t regionsSeen = 0, regionsScanned = 0, bytesScanned = 0;
     for (const OxMapRange &map : scanMaps) {
@@ -2372,18 +2387,70 @@ int main(int argc, char *argv[]) {
     // фоновый поток, чтобы главный цикл рендера запустился с первого кадра, а
     // меню появилось сразу — до этой правки клиент подвисал минуты на сканах
     // памяти (см. лог erafox: обрывался на "TypeInfo fallback из хедера: ...").
+    //
+    // Второе издание: после первой полной диагностики поток НЕ выходит, а спит
+    // 20 сек и повторяет auto-resolve пока хоть один класс не нашёлся. Это
+    // покрывает кейс «чит запущен раньше входа в матч»: в лобби IL2Cpp lazy-load
+    // ещё не тронул PlayerManager, строк в памяти нет — но как только игрок
+    // зайдёт в матч и Unity создаст класс, следующий проход через 20 сек его
+    // подхватит, чит не надо перезапускать. Максимум 45 попыток ≈ 15 мин.
     if (!g_startupThreadStarted.exchange(true)) {
         std::thread([](){
             g_startupInProgress = true;
             ox_setStartupStatus("startup diagnostics...");
             OXLOGI("[startup] фоновая диагностика стартовала (thread)");
-            ox_setScanDeadline(90);   // 90 сек. хватит и на защищённые билды
+            ox_setScanDeadline(90);   // 90 сек на первый полный проход (с офсетами и sweep-ом)
             ox_logStartupDiagnostics();
             ox_clearScanDeadline();
-            ox_setStartupStatus(g_playerManagerKlass ? "ready" : "ready (без klass — matches?)");
-            g_startupDone = true;
             g_startupInProgress = false;
-            OXLOGI("[startup] фоновая диагностика завершена");
+
+            // Если TypeInfo сразу нашлись — работа окончена.
+            if (g_playerManagerKlass || g_buildingPieceKlass) {
+                ox_setStartupStatus("ready");
+                g_startupDone = true;
+                OXLOGI("[startup] TypeInfo найдены с первого прохода");
+                return;
+            }
+
+            // Иначе входим в цикл повторных попыток. UpdatePlayerCache
+            // продолжает работать (мы вышли из g_startupInProgress),
+            // просто до успеха он видит g_playerManagerKlass=0 и не пытается
+            // читать статики. Меню при этом полностью функционально.
+            const int MAX_RETRIES = 45;
+            const int SLEEP_SEC   = 20;
+            for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
+                if (!main_thread_flag) { OXLOGI("[startup] main остановлен, retry-loop выходит"); break; }
+                for (int i = 0; i < SLEEP_SEC && main_thread_flag; ++i) sleep(1);
+                if (!main_thread_flag) break;
+
+                char buf[96];
+                snprintf(buf, sizeof(buf), "retry TypeInfo (%d/%d)...", attempt, MAX_RETRIES);
+                ox_setStartupStatus(buf);
+                OXLOGI("[startup] retry #%d/%d (жду входа в матч)", attempt, MAX_RETRIES);
+
+                g_startupInProgress = true;
+                ox_setScanDeadline(60);
+                ox_autoResolveTypeInfos(false);   // full=false — тихий лог, без hex-дампов
+                ox_clearScanDeadline();
+                g_startupInProgress = false;
+
+                if (g_playerManagerKlass || g_buildingPieceKlass) {
+                    ox_setStartupStatus("ready (found on retry)");
+                    g_startupDone = true;
+                    OXLOGI("[startup] TypeInfo найдены на retry #%d: PM=0x%llx BP=0x%llx",
+                           attempt,
+                           (unsigned long long)g_playerManagerKlass,
+                           (unsigned long long)g_buildingPieceKlass);
+                    return;
+                }
+            }
+            // Все попытки исчерпаны — сдаёмся, но клиент продолжает работать
+            // (меню, dump кнопка). Пользователь может пере-запустить чит уже
+            // из матча.
+            ox_setStartupStatus("no match yet (retry exhausted)");
+            g_startupDone = true;
+            OXLOGW("[startup] %d попыток исчерпано — TypeInfo так и не нашлись. "
+                   "Зайди в матч и перезапусти чит.", MAX_RETRIES);
         }).detach();
     }
 
