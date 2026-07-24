@@ -147,7 +147,14 @@ Unity/il2cpp v39, so they are unchanged.
   (= byvalTypeIndex). Field-offset constants unchanged.
 - `Android.mk`, `Application.mk` — unchanged build config (arm64-v8a, android-29,
   c++_static, release, strip-all). Output module: `eclipsoxide`.
-- `eclipsoxide` — the rebuilt ARM64 executable (links cleanly with `ndk-build`, NDK r27).
+- `eclipsoxide.gz.b64` — the rebuilt ARM64 executable (links cleanly with `ndk-build`,
+  NDK r27), committed as base64-of-gzip because the commit API caps request bodies at 4MB
+  and accepts only text content. Recover the exact binary with:
+
+  ```
+  base64 -d eclipsoxide.gz.b64 | gunzip > eclipsoxide
+  # verify: md5sum eclipsoxide  ->  ad29ded9385beab8d13a6e33ac372d5a  (3494736 bytes)
+  ```
 
 ## Build
 
