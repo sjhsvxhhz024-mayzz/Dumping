@@ -24,14 +24,36 @@
 //  Иерархия виталов: PlayerVitals : EntityVitals : GenericVitals — поэтому
 //  GenericVitals.m_MaxHealth @0x88 читается и через указатель PlayerVitals.
 //
-//  ВНИМАНИЕ — TypeInfo RVA (*_TYPEINFO) НЕ обновлены: script.json этого дампа
-//  содержит только ScriptMethod (RVA методов), без метаданных классов.
-//  Значения ниже — от прошлого билда (устарели). В рантайме их всё равно
-//  перекрывает ox_autoResolveTypeInfo (см. main.cpp) по имени+namespace, поэтому
-//  это только fallback.
+//  === TypeInfo — новая схема (offline + verified через typeinfo_offline.py) ===
+//  Резолвим статически по metadataRegistration->types + верификация имён
+//  в global-metadata.dat. Все VERIFY OK на дампе 2026/07/24 (libil2cpp.so
+//  + global-metadata.dat из split-zip в корне репо). Больше не сканируем
+//  анон-память на старте — резолв за миллисекунды.
+//
+//  Резолв при старте (одним вызовом на класс):
+//    Il2CppType** g = (Il2CppType**)((uint8_t*)il2cpp_base + ox::IL2CPP_TYPES_RVA);
+//    Il2CppClass* k = il2cpp_class_from_il2cpp_type(g[ox::PLAYERMANAGER_TYPEINFO_TYPEIDX]);
+//
+//  Fallback — name-scan из main.cpp (ox_autoResolveTypeInfo) остаётся, но
+//  теперь только для сборок, где types-array не подтверждает канонический тип.
+//
+//  Старые *_TYPEINFO (RVA) сохранены ниже как резервный путь.
 // ============================================================================
 
 namespace ox {
+
+// --- offline TypeInfo (metadataRegistration->types indexing, verified) ---
+// Автосгенерённо typeinfo_offline.py на дампе 2026/07/24. Пересобирать при
+// каждом апдейте libil2cpp.so — типовые индексы съезжают.
+static constexpr uint64_t IL2CPP_TYPES_RVA               = 0xB63EB48; // 104482 entries
+static constexpr int32_t  PLAYERMANAGER_TYPEINFO_TYPEIDX  = 60939;   // Oxide.PlayerManager (TDI 8251)   VERIFY OK
+static constexpr int32_t  BUILDINGPIECE_TYPEINFO_TYPEIDX  = 39693;   // Oxide.Building.BuildingPiece (TDI 8521)   VERIFY OK
+static constexpr int32_t  PLAYERVITALS_TYPEINFO_TYPEIDX   = 61003;   // Oxide.PlayerVitals (TDI 7923)   VERIFY OK
+static constexpr int32_t  RAYCASTMANAGER_TYPEINFO_TYPEIDX = 62162;   // Oxide.RaycastManager (TDI 8048)   VERIFY OK
+static constexpr int32_t  MOUSELOOK_TYPEINFO_TYPEIDX      = 58695;   // Oxide.MouseLook (TDI 7902)   VERIFY OK
+static constexpr int32_t  CAMERA_TYPEINFO_TYPEIDX         = 39710;   // UnityEngine.Camera (TDI 13698)   VERIFY OK
+static constexpr int32_t  ENTITYVITALS_TYPEINFO_TYPEIDX   = 50639;   // Oxide.EntityVitals (TDI 7912)   VERIFY OK
+static constexpr int32_t  GENERICVITALS_TYPEINFO_TYPEIDX  = 52479;   // Oxide.GenericVitals (TDI 7914)   VERIFY OK
 
 // --- Пакет и модуль ---
 static constexpr const char *PACKAGE = "com.catsbit.oxidesurvivalisland";
