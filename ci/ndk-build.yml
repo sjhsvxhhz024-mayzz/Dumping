@@ -1,0 +1,57 @@
+name: NDK build
+
+on:
+  push:
+    branches: [main, "feat/**", "chore/**", "fix/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ndk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ndk-build:
+    name: eclipsoxide (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (required by SDK/NDK cli)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK r27
+        run: |
+          set -euo pipefail
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install \
+              "ndk;27.0.12077973" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Run Python tests (offline dumper)
+        run: |
+          python3 Nov/test_typeinfo_offline.py
+
+      - name: ndk-build
+        working-directory: proj
+        run: |
+          set -euo pipefail
+          "$ANDROID_NDK_HOME/ndk-build" -j"$(nproc)" NDK_APPLICATION_MK=Application.mk
+          ls -lh libs/arm64-v8a/ obj/local/arm64-v8a/ 2>/dev/null || true
+
+      - name: Upload built binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: eclipsoxide-arm64-v8a-${{ github.sha }}
+          path: |
+            proj/libs/arm64-v8a/*
+          if-no-files-found: error
+          retention-days: 30
