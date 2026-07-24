@@ -2,8 +2,9 @@
 # Reconstructed IL2CPP resolver for the protected Oxide build (v39, ARM64).
 import struct
 
-BINPATH='/data/libil2cpp.so'
-METPATH='/data/global-metadata.dat'
+import os as _os
+BINPATH=_os.environ.get('OX_LIBIL2CPP', '/data/libil2cpp.so')
+METPATH=_os.environ.get('OX_METADATA',  '/data/global-metadata.dat')
 B=open(BINPATH,'rb').read()
 M=open(METPATH,'rb').read()
 

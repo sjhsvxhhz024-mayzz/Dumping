@@ -115,3 +115,54 @@ hand-built synthetic ELF + metadata blobs.
 ## Dependencies
 
 Pure Python 3 stdlib. No `capstone`, `lief`, or `pyelftools`.
+
+---
+
+# Full offline dumper pipeline (env-var configurable)
+
+`resolver.py` / `codereg.py` / `dumpgen.py` now read their input/output paths
+from environment variables instead of the old hardcoded `/data/*`. No root,
+no `/data` prepare needed:
+
+```
+OX_LIBIL2CPP=./libil2cpp.so \
+OX_METADATA=./global-metadata.dec.dat \
+OX_CODEREG=./codereg.json \
+OX_DUMP_CS=./dump.cs \
+python3 codereg.py && python3 dumpgen.py
+```
+
+Or use the one-shot wrapper (auto-detects encrypted vs decrypted metadata,
+verifies all 8 known TypeInfos at the end):
+
+```
+./Nov/generate_dump.sh <libil2cpp.so> <global-metadata.dat> [out_dir]
+```
+
+Produces (in `out_dir/`):
+- `global-metadata.dec.dat` — un-XORed header
+- `codereg.json` — per-module `(mpc, mpp)` for RVA resolution
+- `dump.cs` — full `Il2CppDumper` format, all 29366 types with fields
+  (name + type + offset) and methods (name + signature + RVA).
+
+## `field_search.py` — offline dump.cs inspector
+
+Grep-ish tool tuned for the dump format. Finds the right class block by short
+name (won't collide with nested types), enumerates fields/methods with type
+filters, lists enum values in declaration order.
+
+```
+export OX_DUMP_CS=./dump.cs
+
+# fields of a class, filtered by declared type
+python3 Nov/field_search.py --class PlayerWeapon --type-regex 'WeaponState|bool'
+
+# fields by name pattern
+python3 Nov/field_search.py --class PlayerManager --field-regex 'team|user|prime|respawn'
+
+# enum values with computed integer values (0..N-1 in declaration order)
+python3 Nov/field_search.py --list-enum WeaponState
+
+# global regex with N lines of context
+python3 Nov/field_search.py --regex 'AimAssist|IsAiming' --context 3
+```

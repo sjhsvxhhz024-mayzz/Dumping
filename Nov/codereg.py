@@ -46,7 +46,9 @@ mods=[]
 for i in range(total):
     mods.append(module_at(start+i*8))
 
-json.dump({'ARRAY_VA':start,'CNT':total,'modules':mods},open('/data/codereg.json','w'))
+import os as _os
+_out=_os.environ.get('OX_CODEREG','/data/codereg.json')
+json.dump({'ARRAY_VA':start,'CNT':total,'modules':mods},open(_out,'w'))
 print('array start',hex(start),'total',total)
 print('first 6:',[m['name'] for m in mods[:6]])
 print('last 4:',[m['name'] for m in mods[-4:]])

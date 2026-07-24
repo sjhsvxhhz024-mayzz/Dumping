@@ -19,7 +19,8 @@ for i in range(IMG_CNT):
     b=IMG_OFF+i*IMG_REC
     imgs.append({'name':R.cstr(mu32(b)),'ts':mu16(b+8),'tc':mu16(b+10)})
 
-cr=json.load(open('/data/codereg.json'))
+import os as _os
+cr=json.load(open(_os.environ.get('OX_CODEREG','/data/codereg.json')))
 modmap={m['name']:m for m in cr['modules'] if m}
 
 def method_addr(rid,imgname):
@@ -203,5 +204,5 @@ if __name__=='__main__':
     for im in imgs:
         for ti in range(im['ts'],min(im['ts']+im['tc'],TYPE_CNT)):
             out.append(render_type(ti))
-    open('/data/dump.cs','w').write('\n'.join(out)+'\n')
+    open(_os.environ.get('OX_DUMP_CS','/data/dump.cs'),'w').write('\n'.join(out)+'\n')
     print('types',TYPE_CNT)
