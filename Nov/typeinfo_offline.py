@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 typeinfo_offline.py — resolve Il2CppClass* TypeInfo for target classes STATICALLY
-from libil2cpp.so, WITHOUT any runtime log.
+from libil2cpp.so, WITHOUT any runtime log, and VERIFY each result against
+global-metadata.dat so the output is trustworthy (not "picked first, hope").
 
 Why the old approach died
 =========================
@@ -21,9 +22,9 @@ The approach that actually works
 ``Il2CppMetadataRegistration.types`` is a live array of ``Il2CppType*`` (this
 build: RVA 0xB63EB48, 104482 entries). Every class/valuetype ``Il2CppType`` has
 ``data.__klassIndex == TypeDefinitionIndex`` and ``type == IL2CPP_TYPE_CLASS``
-(0x12) or ``IL2CPP_TYPE_VALUETYPE`` (0x11). So for a known TDI we can find the
-*type index* into that array offline, and the mod resolves the class at load
-with a single il2cpp call — no name scan, no in-game log:
+(0x12) or ``IL2CPP_TYPE_VALUETYPE`` (0x11). For a known TDI we find its *type
+index* into that array offline; the mod then resolves the class at load with a
+single il2cpp call — no name scan, no in-game log:
 
     Il2CppType** g_types = (Il2CppType**)((uint8_t*)base + TYPES_RVA);
     Il2CppClass* k = il2cpp_class_from_il2cpp_type(g_types[TYPE_INDEX]);
@@ -31,15 +32,26 @@ with a single il2cpp call — no name scan, no in-game log:
 Pointers live as R_AARCH64_RELATIVE relocations (this is a PIE .so), so the file
 stores 0 and .rela.dyn carries the target VA in the addend; we resolve them.
 
+The 100% part: verification
+===========================
+
+Several Il2CppType entries can share a klassIndex (byref/pinned variants). We
+pick the CANONICAL one (byref=0, pinned=0) and, when global-metadata.dat is
+provided, resolve klassIndex -> Il2CppTypeDefinition.name and assert it equals
+the expected class name. A class is only emitted if it VERIFIES; a mismatch is
+a hard error (exit 3). No guessing.
+
 Usage
 =====
 
-    python3 Nov/typeinfo_offline.py libil2cpp.so
+    python3 Nov/typeinfo_offline.py libil2cpp.so --metadata global-metadata.dat
     python3 Nov/typeinfo_offline.py libil2cpp.so \\
+        --metadata global-metadata.dat \\
         --tdi CAMERA_TYPEINFO:13698:UnityEngine.Camera
     python3 Nov/typeinfo_offline.py libil2cpp.so --legacy   # old .text scan
-    python3 Nov/typeinfo_offline.py libil2cpp.so \\
-        --types-va 0xB63EB48 --types-count 104482
+
+Metadata table constants (string table, typeDefinitions) are overridable for
+other builds via --meta-str / --meta-td-off / --meta-td-count / --meta-td-rec.
 
 Dependencies: pure Python 3 stdlib. No capstone, lief, or pyelftools.
 """
@@ -57,6 +69,18 @@ IL2CPP_TYPE_CLASS = 0x12
 # Default anchor for the metadataRegistration->types array (from the dumper).
 DEFAULT_TYPES_VA = 0xB63EB48
 DEFAULT_TYPES_COUNT = 104482
+
+# global-metadata.dat table constants for this build (validated by the dumper
+# that produced the full, name-correct dump.cs). Overridable via CLI.
+META_MAGIC = 0xFAB11BAF
+DEFAULT_META_STR = 0x000DC0EC       # "string" table (identifiers)
+DEFAULT_META_TD_OFF = 0x01512204    # typeDefinitions table
+DEFAULT_META_TD_COUNT = 29366
+DEFAULT_META_TD_REC = 82            # Il2CppTypeDefinition record size (this build)
+# field offsets inside an Il2CppTypeDefinition record
+MD_NAME = 0x00       # u32 nameIndex   -> string table
+MD_NAMESPACE = 0x04  # u32 namespaceIndex -> string table
+MD_DECLTYPE = 0x0C   # i32 declaringTypeIndex -> metadataReg.types index (or <0)
 
 
 # --- Minimal ELF64 parsing (little-endian, aarch64) --------------------------
@@ -311,13 +335,28 @@ def locate_metadata_registration(img: Image, types_va: int,
     return None
 
 
+class TypeMatch:
+    __slots__ = ("index", "il2cpptype_va", "type_enum", "byref", "pinned")
+
+    def __init__(self, index, va, type_enum, byref, pinned):
+        self.index = index
+        self.il2cpptype_va = va
+        self.type_enum = type_enum
+        self.byref = byref
+        self.pinned = pinned
+
+    @property
+    def canonical(self) -> bool:
+        return self.byref == 0 and self.pinned == 0
+
+
 def find_type_indices(img: Image, types_va: int, types_count: int,
-                      tdi_targets: Dict[int, str]) -> Dict[int, List[Tuple[int, int, int]]]:
-    """For each target TDI, return list of (type_index, il2cpptype_va, type_enum).
+                      tdi_targets: Dict[int, str]) -> Dict[int, List[TypeMatch]]:
+    """For each target TDI, return TypeMatch list (canonical entries first).
 
     Only IL2CPP_TYPE_CLASS / IL2CPP_TYPE_VALUETYPE entries are considered.
     """
-    found: Dict[int, List[Tuple[int, int, int]]] = {t: [] for t in tdi_targets}
+    found: Dict[int, List[TypeMatch]] = {t: [] for t in tdi_targets}
     for i in range(types_count):
         slot = types_va + i * 8
         tptr = img.ptr_at(slot)
@@ -332,8 +371,89 @@ def find_type_indices(img: Image, types_va: int, types_count: int,
         if typ in (IL2CPP_TYPE_CLASS, IL2CPP_TYPE_VALUETYPE):
             ki = dat & 0xFFFFFFFF
             if ki in found:
-                found[ki].append((i, tptr, typ))
+                byref = (bf >> 30) & 1
+                pinned = (bf >> 31) & 1
+                found[ki].append(TypeMatch(i, tptr, typ, byref, pinned))
+    # canonical (byref=0, pinned=0) first, then by index
+    for ki in found:
+        found[ki].sort(key=lambda m: (0 if m.canonical else 1, m.index))
     return found
+
+
+# --- global-metadata.dat name verification -----------------------------------
+
+class Metadata:
+    """Reads Il2CppTypeDefinition names from (already-decrypted) metadata."""
+
+    def __init__(self, data: bytes, str_off: int, td_off: int,
+                 td_count: int, td_rec: int):
+        self.data = data
+        self.str_off = str_off
+        self.td_off = td_off
+        self.td_count = td_count
+        self.td_rec = td_rec
+        magic = struct.unpack_from("<I", data, 0)[0]
+        if magic != META_MAGIC:
+            raise SystemExit(f"[!] bad metadata magic 0x{magic:X} (expected 0x{META_MAGIC:X})")
+
+    def cstr(self, rel: int) -> str:
+        if rel < 0:
+            return ""
+        o = self.str_off + rel
+        e = self.data.find(b"\x00", o)
+        return self.data[o:e].decode("utf-8", "replace")
+
+    def _td(self, i: int) -> int:
+        return self.td_off + i * self.td_rec
+
+    def name_index(self, i: int) -> int:
+        return struct.unpack_from("<I", self.data, self._td(i) + MD_NAME)[0]
+
+    def ns_index(self, i: int) -> int:
+        return struct.unpack_from("<I", self.data, self._td(i) + MD_NAMESPACE)[0]
+
+    def decl_type_index(self, i: int) -> int:
+        return struct.unpack_from("<i", self.data, self._td(i) + MD_DECLTYPE)[0]
+
+
+def _typedef_of_typeindex(img: Image, types_va: int, types_count: int,
+                          tidx: int) -> int:
+    if tidx < 0 or tidx >= types_count:
+        return -1
+    va = img.ptr_at(types_va + tidx * 8)
+    if va is None:
+        return -1
+    fo = img.va_to_off(va)
+    if fo is None:
+        return -1
+    return struct.unpack_from("<Q", img.data, fo)[0] & 0xFFFFFFFF
+
+
+def class_full_name(meta: Metadata, img: Image, types_va: int, types_count: int,
+                    klass_index: int) -> str:
+    """Reconstruct Namespace.Outer.Name for a TypeDefinitionIndex.
+
+    Walks declaringType (a metadataReg.types index) to prefix nested names,
+    matching the dumper's proven logic; strips generic-arity backticks.
+    """
+    if klass_index < 0 or klass_index >= meta.td_count:
+        return "?"
+    parts = [meta.cstr(meta.name_index(klass_index))]
+    d = meta.decl_type_index(klass_index)
+    top = klass_index
+    guard = 0
+    while d >= 0 and guard < 12:
+        di = _typedef_of_typeindex(img, types_va, types_count, d)
+        if di < 0 or di >= meta.td_count:
+            break
+        parts.append(meta.cstr(meta.name_index(di)))
+        top = di
+        d = meta.decl_type_index(di)
+        guard += 1
+    ns = meta.cstr(meta.ns_index(top))
+    name = ".".join(reversed(parts))
+    name = ".".join(seg.split("`")[0] for seg in name.split("."))
+    return (ns + "." + name) if ns else name
 
 
 # --- Targets -----------------------------------------------------------------
@@ -354,7 +474,7 @@ def parse_targets(extra: List[str]) -> List[Tuple[str, int, str]]:
             continue
         name = parts[0].strip()
         tdi = int(parts[1], 0)
-        cname = parts[2] if len(parts) > 2 else "(custom)"
+        cname = parts[2] if len(parts) > 2 else ""
         targets.append((name, tdi, cname))
     return targets
 
@@ -374,7 +494,7 @@ def run_legacy(path: str, targets) -> int:
         cands = find_slots_for_tdi(text, text_va, tdi)
         if cands:
             any_hit = True
-        print(f"// {cname} (TDI {tdi}): {len(cands)} candidate(s)")
+        print(f"// {cname or name} (TDI {tdi}): {len(cands)} candidate(s)")
         for mv, bl, sv in cands:
             print(f"//   MOVZ=0x{mv:X} BL=0x{bl:X} slot=0x{sv:X}")
     if not any_hit:
@@ -382,7 +502,8 @@ def run_legacy(path: str, targets) -> int:
     return 0
 
 
-def run_typeindex(path: str, targets, types_va: int, types_count: int) -> int:
+def run_typeindex(path: str, targets, types_va: int, types_count: int,
+                  meta: Optional[Metadata]) -> int:
     data, _ = parse_elf(path)
     img = Image(data)
 
@@ -399,12 +520,12 @@ def run_typeindex(path: str, targets, types_va: int, types_count: int) -> int:
             print(f"      {nm:22s} count={c:<10d} ptr={('0x%X' % p) if p else 'null'}",
                   file=sys.stderr)
 
-    tdi_targets = {tdi: cname for _, tdi, cname in targets}
+    tdi_targets = {tdi: (cname or name) for name, tdi, cname in targets}
     found = find_type_indices(img, types_va, types_count, tdi_targets)
 
     print()
     print("// ---------------------------------------------------------------")
-    print("// oxide_offsets.h  \u2014  TypeInfo resolution (offline, static)")
+    print("// oxide_offsets.h  \u2014  TypeInfo resolution (offline, static, verified)")
     print("// Generated by Nov/typeinfo_offline.py (type-index method)")
     print("// ---------------------------------------------------------------")
     print(f"static constexpr uint64_t IL2CPP_TYPES_RVA = 0x{types_va:X}; "
@@ -413,42 +534,75 @@ def run_typeindex(path: str, targets, types_va: int, types_count: int) -> int:
     print("// Resolve at load (once), no runtime log / no name scan:")
     print("//   Il2CppType** g = (Il2CppType**)((uint8_t*)il2cpp_base + IL2CPP_TYPES_RVA);")
     print("//   Il2CppClass* k = il2cpp_class_from_il2cpp_type(g[<TYPE_INDEX>]);")
-    print("//   // optional one-time sanity: strcmp(il2cpp_class_get_name(k), \"...\")")
+    if meta is None:
+        print("// NOTE: run with --metadata global-metadata.dat to VERIFY each name.")
 
     rc = 0
-    for name, tdi, cname in targets:
+    for name, tdi, expected in targets:
         cands = found.get(tdi, [])
-        print(f"\n// --- {cname} (TypeDefIndex {tdi}) ---")
+        label = expected or name
+        print(f"\n// --- {label} (TypeDefIndex {tdi}) ---")
         if not cands:
             print(f"//   UNRESOLVED: no IL2CPP_TYPE_CLASS/VALUETYPE with klassIndex={tdi}")
             print(f"//   (fallback: runtime ox_scanClassByName)")
             rc = 2
             continue
-        idx, tva, typ = cands[0]
-        kind = "CLASS" if typ == IL2CPP_TYPE_CLASS else "VALUETYPE"
-        print(f"//   {len(cands)} matching Il2CppType(s); picked first ({kind})")
-        print(f"//   Il2CppType @0x{tva:X}")
-        print(f"static constexpr int32_t  {name}_TYPEIDX = {idx}; // {cname}")
+        pick = cands[0]
+        kind = "CLASS" if pick.type_enum == IL2CPP_TYPE_CLASS else "VALUETYPE"
+        canon = "canonical" if pick.canonical else f"byref={pick.byref} pinned={pick.pinned}"
+        print(f"//   {len(cands)} matching Il2CppType(s); picked idx {pick.index} ({kind}, {canon})")
+        print(f"//   Il2CppType @0x{pick.il2cpptype_va:X}")
+
+        if meta is not None:
+            got = class_full_name(meta, img, types_va, types_count, tdi)
+            if expected and got != expected:
+                print(f"//   VERIFY FAIL: metadata name '{got}' != expected '{expected}'")
+                rc = 3
+                continue
+            tag = f"verified '{got}'" if expected else f"metadata name '{got}'"
+            print(f"//   VERIFY OK: {tag}")
+
+        print(f"static constexpr int32_t  {name}_TYPEIDX = {pick.index}; // {label}")
         if len(cands) > 1:
-            alt = ", ".join(str(c[0]) for c in cands[1:])
-            print(f"//   other indices (same class, equivalent): {alt}")
+            alt = ", ".join(str(c.index) for c in cands[1:])
+            print(f"//   equivalent indices (same class): {alt}")
     print()
+    if rc == 3:
+        print("[!] one or more classes FAILED verification", file=sys.stderr)
     return rc
+
+
+def load_metadata(args) -> Optional[Metadata]:
+    if not args.metadata:
+        return None
+    with open(args.metadata, "rb") as f:
+        data = f.read()
+    return Metadata(data, args.meta_str, args.meta_td_off,
+                    args.meta_td_count, args.meta_td_rec)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Offline TypeInfo resolver for il2cpp (v27+/v39).",
+        description="Offline + verified TypeInfo resolver for il2cpp (v27+/v39).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     ap.add_argument("libil2cpp", help="path to libil2cpp.so")
+    ap.add_argument("--metadata", help="path to (decrypted) global-metadata.dat for name verification")
     ap.add_argument("--tdi", action="append", default=[],
-                    help="extra target NAME:TDI[:Full.Type.Name] (repeatable)")
+                    help="extra target NAME:TDI[:Expected.Full.Name] (repeatable)")
     ap.add_argument("--types-va", type=lambda x: int(x, 0), default=DEFAULT_TYPES_VA,
                     help="VA of metadataRegistration->types (default 0x%X)" % DEFAULT_TYPES_VA)
     ap.add_argument("--types-count", type=lambda x: int(x, 0), default=DEFAULT_TYPES_COUNT,
                     help="entry count of types array (default %d)" % DEFAULT_TYPES_COUNT)
+    ap.add_argument("--meta-str", type=lambda x: int(x, 0), default=DEFAULT_META_STR,
+                    help="metadata string table offset (default 0x%X)" % DEFAULT_META_STR)
+    ap.add_argument("--meta-td-off", type=lambda x: int(x, 0), default=DEFAULT_META_TD_OFF,
+                    help="metadata typeDefinitions offset (default 0x%X)" % DEFAULT_META_TD_OFF)
+    ap.add_argument("--meta-td-count", type=lambda x: int(x, 0), default=DEFAULT_META_TD_COUNT,
+                    help="typeDefinitions count (default %d)" % DEFAULT_META_TD_COUNT)
+    ap.add_argument("--meta-td-rec", type=lambda x: int(x, 0), default=DEFAULT_META_TD_REC,
+                    help="Il2CppTypeDefinition record size (default %d)" % DEFAULT_META_TD_REC)
     ap.add_argument("--legacy", action="store_true",
                     help="run the old .text MOVZ/BL/ADRP/STR scan instead")
     args = ap.parse_args()
@@ -456,7 +610,8 @@ def main() -> int:
     targets = parse_targets(args.tdi)
     if args.legacy:
         return run_legacy(args.libil2cpp, targets)
-    return run_typeindex(args.libil2cpp, targets, args.types_va, args.types_count)
+    meta = load_metadata(args)
+    return run_typeindex(args.libil2cpp, targets, args.types_va, args.types_count, meta)
 
 
 if __name__ == "__main__":

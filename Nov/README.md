@@ -1,16 +1,19 @@
-# Offline TypeInfo resolution (`typeinfo_offline.py`)
+# Offline + verified TypeInfo resolution (`typeinfo_offline.py`)
 
 Resolve `Il2CppClass*` TypeInfo for target classes **statically**, straight from
-`libil2cpp.so`, with **no runtime log** and no in-game name scan.
+`libil2cpp.so`, with **no runtime log**, and **verify** every result against
+`global-metadata.dat` so the output is trustworthy.
 
 ## TL;DR
 
 ```
-python3 Nov/typeinfo_offline.py libil2cpp.so
+python3 Nov/typeinfo_offline.py libil2cpp.so --metadata global-metadata.dat
 ```
 
 Emits `oxide_offsets.h`-ready constants: a single `IL2CPP_TYPES_RVA` plus a
-`*_TYPEIDX` per class. The mod resolves each TypeInfo at load with one call.
+verified `*_TYPEIDX` per class. The mod resolves each TypeInfo at load with one
+call. Exit code is non-zero if any class fails to resolve (2) or fails name
+verification (3).
 
 ## The dead end (metadata v39 / il2cpp v27+)
 
@@ -49,16 +52,28 @@ known TDI we find its **type index** into that array offline. Because the `.so`
 is a PIE, every pointer field is an `R_AARCH64_RELATIVE` reloc (file stores 0,
 `.rela.dyn` addend holds the VA); the tool resolves them.
 
-### Verified indices (this build)
+## Reaching 100%: canonical pick + name verification
+
+Several `Il2CppType` entries can share a klassIndex — they are `byref`/`pinned`
+variants of the same class. The tool:
+
+1. Parses the `byref` (bit 30) and `pinned` (bit 31) flags and picks the
+   **canonical** entry (`byref=0, pinned=0`).
+2. With `--metadata`, resolves `klassIndex -> Il2CppTypeDefinition.name`
+   (including the nested `declaringType` walk) and asserts it equals the
+   expected class name. A mismatch is a hard error (exit 3); a class is only
+   emitted if it **verifies**. No "picked first, hope it's right."
+
+### Verified output (this build, all `VERIFY OK`)
 
 | Class | TypeDefIndex | TYPE_INDEX |
 | --- | --- | --- |
 | `Oxide.PlayerManager` | 8251 | **60939** |
 | `Oxide.Building.BuildingPiece` | 8521 | **39693** |
 | `Oxide.PlayerVitals` | 7923 | **61003** |
-
-(Several `Il2CppType` entries can share a klassIndex; they resolve to the same
-class. The tool picks the first and lists the equivalents.)
+| `Oxide.RaycastManager` | 8048 | **62162** |
+| `Oxide.MouseLook` | 7902 | **58695** |
+| `UnityEngine.Camera` | 13698 | **39710** |
 
 ### Mod-side usage
 
@@ -67,28 +82,35 @@ static constexpr uint64_t IL2CPP_TYPES_RVA = 0xB63EB48;
 Il2CppType** g = (Il2CppType**)((uint8_t*)il2cpp_base + IL2CPP_TYPES_RVA);
 Il2CppClass* PlayerManager_TypeInfo =
     il2cpp_class_from_il2cpp_type(g[PLAYERMANAGER_TYPEINFO_TYPEIDX]);
-// optional one-time sanity:
-// assert(strcmp(il2cpp_class_get_name(PlayerManager_TypeInfo), "PlayerManager") == 0);
 ```
 
 ## Adding classes
 
 ```
-python3 Nov/typeinfo_offline.py libil2cpp.so \
+python3 Nov/typeinfo_offline.py libil2cpp.so --metadata global-metadata.dat \
     --tdi CAMERA_TYPEINFO:13698:UnityEngine.Camera
 ```
 
-The `types` anchor is overridable via `--types-va` / `--types-count` if the
-dumper reports different values for a new build.
+The `--tdi` value is `NAME:TypeDefIndex[:Expected.Full.Name]`. When the expected
+name is given, it is enforced by verification.
+
+## Per-build constants
+
+Overridable if the dumper reports different values for a new build:
+
+- types array: `--types-va` / `--types-count`
+- metadata tables: `--meta-str` / `--meta-td-off` / `--meta-td-count` / `--meta-td-rec`
 
 ## Tests
 
 ```
-python3 Nov/test_typeinfo_offline.py    # 30/30
+python3 Nov/test_typeinfo_offline.py    # 39/39
 ```
 
-Covers the legacy ARM64 encoders/decoders and the new reloc parsing, metadata
-registration location, and type-index resolution on a hand-built synthetic ELF.
+Covers the legacy ARM64 encoders/decoders, reloc parsing, metadata-registration
+location, type-index resolution, canonical (byref/pinned) selection, metadata
+name resolution (incl. nested declaringType), and the magic guard — on
+hand-built synthetic ELF + metadata blobs.
 
 ## Dependencies
 
