@@ -103,6 +103,30 @@ int abs_ScreenY = 0;
 int game_pid = -1;
 uint64_t il2cpp_base = 0;
 
+// ============================================================================
+//  Startup-scan governance.
+//
+//  OX_TRUST_HEADER_TYPEINFO (default 1):
+//    Верим значениям PLAYERMANAGER_TYPEINFO / BUILDINGPIECE_TYPEINFO /
+//    PLAYERVITALS_TYPEINFO из oxide_offsets.h. При старте пробуем seed из
+//    хедера (одна дереф + проверка имени класса) — если сходится, klass'ы
+//    заполнены за миллисекунды, весь скан-путь пропускается: нет sweep-а
+//    менеджеров, нет 45×20с retry, нет 200 MB/с memmem-прогрева. Если seed
+//    не сходится (RVA протух, версия сменилась) — падаем на прежний
+//    scan-based резолв через ox_autoResolveTypeInfos.
+//
+//  OX_DEEP_DIAG (default 0):
+//    Полный sweep всех известных TypeInfo в конце startup-диагностики.
+//    Нужен только когда обновляется libil2cpp.so и надо вытащить свежие
+//    RVA для oxide_offsets.h — обычному пользователю это лаг без пользы.
+// ============================================================================
+#ifndef OX_TRUST_HEADER_TYPEINFO
+#define OX_TRUST_HEADER_TYPEINFO 1
+#endif
+#ifndef OX_DEEP_DIAG
+#define OX_DEEP_DIAG 0
+#endif
+
 // Типовые RVA из последнего dump.cs — fallback. Runtime resolver может заменить
 // их на найденные в запущенной версии игры без пересборки после обновления.
 static uint64_t g_playerManagerTypeInfoRVA = ox::PLAYERMANAGER_TYPEINFO;
@@ -1030,6 +1054,56 @@ static bool ox_autoResolveTypeInfo(const char *className, const char *nameSpace,
     return false;
 }
 
+// Fast-seed: попытаться взять klass-указатели прямо из хардкода в шапке,
+// без сканов памяти. Работает, когда TypeInfo RVA из oxide_offsets.h
+// соответствуют текущему libil2cpp.so (типичный случай сразу после update
+// дампа через Nov/typeinfo_offline.py).
+//
+// Схема: klass = rpm(il2cpp_base + <TYPEINFO_RVA>); валидируем чтением имени
+// класса — если строки совпадают, значение принято. Если хоть один из
+// PlayerManager / BuildingPiece не подтвердился, возвращаем false и вызывающий
+// код падает на старый scan-based резолв.
+static bool ox_fastSeedTypeInfoFromHeader() {
+    if (!il2cpp_base) return false;
+    struct Seed {
+        uint64_t rva;
+        const char *expected;
+        uint64_t   *klass_out;
+        uint64_t   *rva_out;
+    };
+    Seed seeds[] = {
+        { ox::PLAYERMANAGER_TYPEINFO, "PlayerManager",
+          &g_playerManagerKlass, &g_playerManagerTypeInfoRVA },
+        { ox::BUILDINGPIECE_TYPEINFO, "BuildingPiece",
+          &g_buildingPieceKlass, &g_buildingPieceTypeInfoRVA },
+    };
+    int seeded = 0;
+    for (const Seed &s : seeds) {
+        uint64_t at    = il2cpp_base + s.rva;
+        uint64_t klass = rpm<uint64_t>(at);
+        if (!ox_isPtr(klass)) {
+            OXLOGW("[fast-seed] %s: base+RVA=0x%llx -> klass=0x%llx (не похоже на указатель)",
+                   s.expected, (unsigned long long)at, (unsigned long long)klass);
+            continue;
+        }
+        char cn[96] = {0};
+        ox_className(klass, cn, sizeof(cn));
+        if (cn[0] == 0 || strcmp(cn, s.expected) != 0) {
+            OXLOGW("[fast-seed] %s: klass=0x%llx имя='%s' — mismatch, падаю на scan",
+                   s.expected, (unsigned long long)klass, cn);
+            continue;
+        }
+        *s.klass_out = klass;
+        *s.rva_out   = s.rva;
+        ++seeded;
+        OXLOGI("[fast-seed] %s: klass=0x%llx через хедер (RVA=0x%llx) — верифицировано именем",
+               s.expected, (unsigned long long)klass, (unsigned long long)s.rva);
+    }
+    bool ok = (seeded == (int)(sizeof(seeds) / sizeof(seeds[0])));
+    g_typeInfoAutoResolved = ok;
+    return ok;
+}
+
 static bool ox_autoResolveTypeInfos(bool full) {
     uint64_t playerRVA = 0, buildingRVA = 0, playerKlass = 0, buildingKlass = 0;
     bool playerOk = ox_autoResolveTypeInfo("PlayerManager", "Oxide", playerRVA, playerKlass, full);
@@ -1240,6 +1314,16 @@ static uint64_t ox_getStatics(bool full) {
             if (full) OXLOGW("Кэш klass протух ('%s') — пере-резолв", vn);
             g_playerManagerKlass = 0;
         }
+    }
+    if (!ox_isPtr(g_playerManagerKlass)) {
+        // Fast-seed сначала — если хедер валиден, восстанавливаем klass без скана.
+        // Типичный триггер: база libil2cpp сменилась (line 2152 занулил klass'ы),
+        // либо кэш был отброшен как протухший чуть выше.
+#if OX_TRUST_HEADER_TYPEINFO
+        if (ox_fastSeedTypeInfoFromHeader()) {
+            if (full) OXLOGI("[AUTO] re-seed из хедера — klass восстановлен без скана");
+        }
+#endif
     }
     if (!ox_isPtr(g_playerManagerKlass)) {
         // Скан анонимной памяти дорогой — троттлим, чтобы не морозить оверлей до матча.
@@ -2316,12 +2400,16 @@ static void ox_logStartupDiagnostics() {
     OXDUMP(BP_PIECE_NAME); OXDUMP(BP_ID); OXDUMP(BP_HEALTH); OXDUMP(BP_MAXHEALTH);
     #undef OXDUMP
 
-    // Полный runtime-sweep всех известных TypeInfo — то, что erafox просил в чате:
-    // «нужно же найти все тайпинфо рва оффсеты логгингом». Вывод пойдёт в тот же
-    // /sdcard/Download/EclipsOxide/eclips_oxide_*.log — оттуда переносить в
-    // include/oxide_offsets.h.
+    // Полный runtime-sweep всех известных TypeInfo — 11 классов ×
+    // ox_findAscii+ox_scanClassByName по writable/anon памяти. При стабильной
+    // шапке это чистый лаг; включается только под OX_DEEP_DIAG (при апдейте
+    // libil2cpp.so, когда действительно нужны свежие RVA).
+#if OX_DEEP_DIAG
     if (il2cpp_base) ox_sweepAllTypeInfos(true);
     else OXLOGW("[sweep] пропущен: il2cpp_base ещё не готова");
+#else
+    OXLOGI("[sweep] пропущен (OX_DEEP_DIAG=0). Включить: -DOX_DEEP_DIAG=1");
+#endif
 
     OXLOGI("STARTUP DIAGNOSTICS завершён");
 }
@@ -2399,6 +2487,23 @@ int main(int argc, char *argv[]) {
             g_startupInProgress = true;
             ox_setStartupStatus("startup diagnostics...");
             OXLOGI("[startup] фоновая диагностика стартовала (thread)");
+
+#if OX_TRUST_HEADER_TYPEINFO
+            // Быстрый путь: если шапка не протухла — seed за миллисекунды и выходим.
+            // Ни sweep-а, ни ascii-скана, ни retry-loop; klass'ы валидированы именем.
+            ox_setStartupStatus("fast-seed from header...");
+            if (ox_fastSeedTypeInfoFromHeader()) {
+                OXLOGI("[startup] fast-seed OK — сканы пропущены (PM=0x%llx BP=0x%llx)",
+                       (unsigned long long)g_playerManagerKlass,
+                       (unsigned long long)g_buildingPieceKlass);
+                ox_setStartupStatus("ready (fast-seed)");
+                g_startupInProgress = false;
+                g_startupDone = true;
+                return;
+            }
+            OXLOGW("[startup] fast-seed не подтвердил RVA — падаю на scan-путь");
+#endif
+
             ox_setScanDeadline(90);   // 90 сек на первый полный проход (с офсетами и sweep-ом)
             ox_logStartupDiagnostics();
             ox_clearScanDeadline();
